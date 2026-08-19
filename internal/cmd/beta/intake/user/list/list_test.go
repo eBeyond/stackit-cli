@@ -2,6 +2,11 @@ package list
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -9,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	sdkConfig "github.com/stackitcloud/stackit-sdk-go/core/config"
 	intake "github.com/stackitcloud/stackit-sdk-go/services/intake/v1betaapi"
 
 	"github.com/stackitcloud/stackit-cli/internal/pkg/testparams"
@@ -22,7 +28,8 @@ import (
 type testCtxKey struct{}
 
 const (
-	testRegion = "eu01"
+	testRegion        = "eu01"
+	testNextPageToken = "next-page-token-123"
 )
 
 var (
@@ -164,6 +171,147 @@ func TestBuildRequest(t *testing.T) {
 			)
 			if diff != "" {
 				t.Fatalf("Data does not match: %s", diff)
+			}
+		})
+	}
+}
+
+type testResponse struct {
+	statusCode int
+	body       intake.ListIntakeUsersResponse
+}
+
+func fixtureTestResponse(mods ...func(resp *testResponse)) testResponse {
+	resp := testResponse{
+		statusCode: 200,
+	}
+	for _, mod := range mods {
+		mod(&resp)
+	}
+	return resp
+}
+
+func fixtureIntakeUsers(count int) []intake.IntakeUserResponse {
+	items := make([]intake.IntakeUserResponse, count)
+	for i := range count {
+		items[i] = intake.IntakeUserResponse{
+			Id:          fmt.Sprintf("user-%d", i+1),
+			DisplayName: fmt.Sprintf("user-%d", i+1),
+			Type:        intake.USERTYPE_INTAKE,
+		}
+	}
+	return items
+}
+
+func TestFetchIntakeUsers(t *testing.T) {
+	tests := []struct {
+		description string
+		limit       int64
+		responses   []testResponse
+		expected    []intake.IntakeUserResponse
+		fails       bool
+	}{
+		{
+			description: "no items",
+			responses: []testResponse{
+				fixtureTestResponse(),
+			},
+			expected: []intake.IntakeUserResponse{},
+		},
+		{
+			description: "single item, single page",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.IntakeUsers = fixtureIntakeUsers(1)
+				}),
+			},
+			expected: fixtureIntakeUsers(1),
+		},
+		{
+			description: "multiple pages",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.NextPageToken = utils.Ptr(testNextPageToken)
+					resp.body.IntakeUsers = fixtureIntakeUsers(1)
+				}),
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.IntakeUsers = fixtureIntakeUsers(1)
+				}),
+			},
+			expected: slices.Concat(fixtureIntakeUsers(1), fixtureIntakeUsers(1)),
+		},
+		{
+			description: "limit stops pagination once reached",
+			limit:       1,
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.NextPageToken = utils.Ptr(testNextPageToken)
+					resp.body.IntakeUsers = fixtureIntakeUsers(1)
+				}),
+			},
+			expected: fixtureIntakeUsers(1),
+		},
+		{
+			description: "API error",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.statusCode = 500
+				}),
+			},
+			fails: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.description, func(t *testing.T) {
+			callCount := 0
+			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				resp := tt.responses[callCount]
+				callCount++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.statusCode)
+				bs, err := json.Marshal(resp.body)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				_, err = w.Write(bs)
+				if err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			})
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			client, err := intake.NewAPIClient(
+				sdkConfig.WithEndpoint(server.URL),
+				sdkConfig.WithoutAuthentication(),
+			)
+			if err != nil {
+				t.Fatalf("failed to create test client: %v", err)
+			}
+			var mods []func(m *inputModel)
+			if tt.limit > 0 {
+				mods = append(mods, func(m *inputModel) {
+					m.Limit = utils.Ptr(tt.limit)
+				})
+			}
+			model := fixtureInputModel(mods...)
+			got, err := fetchIntakeUsers(testCtx, model, client)
+			if err != nil {
+				if !tt.fails {
+					t.Fatalf("fetchIntakeUsers() unexpected error: %v", err)
+				}
+				return
+			}
+			if tt.fails {
+				t.Fatalf("fetchIntakeUsers() expected an error, got none")
+			}
+			if callCount != len(tt.responses) {
+				t.Errorf("fetchIntakeUsers() expected %d calls, got %d", len(tt.responses), callCount)
+			}
+			diff := cmp.Diff(got, tt.expected,
+				cmpopts.IgnoreFields(intake.IntakeUserResponse{}, "AdditionalProperties"),
+			)
+			if diff != "" {
+				t.Errorf("fetchIntakeUsers() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

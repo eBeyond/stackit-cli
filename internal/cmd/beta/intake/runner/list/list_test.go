@@ -2,6 +2,11 @@ package list
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -9,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	sdkConfig "github.com/stackitcloud/stackit-sdk-go/core/config"
 	intake "github.com/stackitcloud/stackit-sdk-go/services/intake/v1betaapi"
 
 	"github.com/stackitcloud/stackit-cli/internal/pkg/globalflags"
@@ -21,8 +27,9 @@ import (
 type testCtxKey struct{}
 
 const (
-	testRegion = "eu01"
-	testLimit  = int64(5)
+	testRegion        = "eu01"
+	testLimit         = int64(5)
+	testNextPageToken = "next-page-token-123"
 )
 
 var (
@@ -147,6 +154,146 @@ func TestBuildRequest(t *testing.T) {
 			)
 			if diff != "" {
 				t.Fatalf("Data does not match: %s", diff)
+			}
+		})
+	}
+}
+
+type testResponse struct {
+	statusCode int
+	body       intake.ListIntakeRunnersResponse
+}
+
+func fixtureTestResponse(mods ...func(resp *testResponse)) testResponse {
+	resp := testResponse{
+		statusCode: 200,
+	}
+	for _, mod := range mods {
+		mod(&resp)
+	}
+	return resp
+}
+
+func fixtureIntakeRunners(count int) []intake.IntakeRunnerResponse {
+	items := make([]intake.IntakeRunnerResponse, count)
+	for i := range count {
+		items[i] = intake.IntakeRunnerResponse{
+			Id:          fmt.Sprintf("runner-%d", i+1),
+			DisplayName: fmt.Sprintf("runner-%d", i+1),
+		}
+	}
+	return items
+}
+
+func TestFetchIntakeRunners(t *testing.T) {
+	tests := []struct {
+		description string
+		limit       int64
+		responses   []testResponse
+		expected    []intake.IntakeRunnerResponse
+		fails       bool
+	}{
+		{
+			description: "no items",
+			responses: []testResponse{
+				fixtureTestResponse(),
+			},
+			expected: []intake.IntakeRunnerResponse{},
+		},
+		{
+			description: "single item, single page",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.IntakeRunners = fixtureIntakeRunners(1)
+				}),
+			},
+			expected: fixtureIntakeRunners(1),
+		},
+		{
+			description: "multiple pages",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.NextPageToken = utils.Ptr(testNextPageToken)
+					resp.body.IntakeRunners = fixtureIntakeRunners(1)
+				}),
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.IntakeRunners = fixtureIntakeRunners(1)
+				}),
+			},
+			expected: slices.Concat(fixtureIntakeRunners(1), fixtureIntakeRunners(1)),
+		},
+		{
+			description: "limit stops pagination once reached",
+			limit:       1,
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.NextPageToken = utils.Ptr(testNextPageToken)
+					resp.body.IntakeRunners = fixtureIntakeRunners(1)
+				}),
+			},
+			expected: fixtureIntakeRunners(1),
+		},
+		{
+			description: "API error",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.statusCode = 500
+				}),
+			},
+			fails: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.description, func(t *testing.T) {
+			callCount := 0
+			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				resp := tt.responses[callCount]
+				callCount++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.statusCode)
+				bs, err := json.Marshal(resp.body)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				_, err = w.Write(bs)
+				if err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			})
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			client, err := intake.NewAPIClient(
+				sdkConfig.WithEndpoint(server.URL),
+				sdkConfig.WithoutAuthentication(),
+			)
+			if err != nil {
+				t.Fatalf("failed to create test client: %v", err)
+			}
+			var mods []func(m *inputModel)
+			if tt.limit > 0 {
+				mods = append(mods, func(m *inputModel) {
+					m.Limit = utils.Ptr(tt.limit)
+				})
+			}
+			model := fixtureInputModel(mods...)
+			got, err := fetchIntakeRunners(testCtx, model, client)
+			if err != nil {
+				if !tt.fails {
+					t.Fatalf("fetchIntakeRunners() unexpected error: %v", err)
+				}
+				return
+			}
+			if tt.fails {
+				t.Fatalf("fetchIntakeRunners() expected an error, got none")
+			}
+			if callCount != len(tt.responses) {
+				t.Errorf("fetchIntakeRunners() expected %d calls, got %d", len(tt.responses), callCount)
+			}
+			diff := cmp.Diff(got, tt.expected,
+				cmpopts.IgnoreFields(intake.IntakeRunnerResponse{}, "AdditionalProperties"),
+			)
+			if diff != "" {
+				t.Errorf("fetchIntakeRunners() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

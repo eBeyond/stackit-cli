@@ -2,6 +2,11 @@ package list
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -9,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	sdkConfig "github.com/stackitcloud/stackit-sdk-go/core/config"
 	intake "github.com/stackitcloud/stackit-sdk-go/services/intake/v1betaapi"
 
 	"github.com/stackitcloud/stackit-cli/internal/pkg/globalflags"
@@ -29,8 +35,9 @@ var (
 	testClient = &intake.APIClient{
 		DefaultAPI: &intake.DefaultAPIService{},
 	}
-	testProjectId = uuid.NewString()
-	testLimit     = int64(5)
+	testProjectId     = uuid.NewString()
+	testLimit         = int64(5)
+	testNextPageToken = "next-page-token-123"
 )
 
 func fixtureFlagValues(mods ...func(flagValues map[string]string)) map[string]string {
@@ -146,6 +153,147 @@ func TestBuildRequest(t *testing.T) {
 			)
 			if diff != "" {
 				t.Fatalf("Data does not match: %s", diff)
+			}
+		})
+	}
+}
+
+type testResponse struct {
+	statusCode int
+	body       intake.ListIntakesResponse
+}
+
+func fixtureTestResponse(mods ...func(resp *testResponse)) testResponse {
+	resp := testResponse{
+		statusCode: 200,
+	}
+	for _, mod := range mods {
+		mod(&resp)
+	}
+	return resp
+}
+
+func fixtureIntakes(count int) []intake.IntakeResponse {
+	items := make([]intake.IntakeResponse, count)
+	for i := range count {
+		items[i] = intake.IntakeResponse{
+			Id:          fmt.Sprintf("intake-%d", i+1),
+			DisplayName: fmt.Sprintf("intake-%d", i+1),
+		}
+	}
+	return items
+}
+
+func TestFetchIntakes(t *testing.T) {
+	tests := []struct {
+		description string
+		limit       int64
+		responses   []testResponse
+		expected    []intake.IntakeResponse
+		fails       bool
+	}{
+		{
+			description: "no items",
+			responses: []testResponse{
+				fixtureTestResponse(),
+			},
+			expected: []intake.IntakeResponse{},
+		},
+		{
+			description: "single item, single page",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.Intakes = fixtureIntakes(1)
+				}),
+			},
+			expected: fixtureIntakes(1),
+		},
+		{
+			description: "multiple pages",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.NextPageToken = utils.Ptr(testNextPageToken)
+					resp.body.Intakes = fixtureIntakes(1)
+				}),
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.Intakes = fixtureIntakes(1)
+				}),
+			},
+			expected: slices.Concat(fixtureIntakes(1), fixtureIntakes(1)),
+		},
+		{
+			description: "limit stops pagination once reached",
+			limit:       1,
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.body.NextPageToken = utils.Ptr(testNextPageToken)
+					resp.body.Intakes = fixtureIntakes(1)
+				}),
+			},
+			expected: fixtureIntakes(1),
+		},
+		{
+			description: "API error",
+			responses: []testResponse{
+				fixtureTestResponse(func(resp *testResponse) {
+					resp.statusCode = 500
+				}),
+			},
+			fails: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.description, func(t *testing.T) {
+			callCount := 0
+			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				resp := tt.responses[callCount]
+				callCount++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.statusCode)
+				bs, err := json.Marshal(resp.body)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				_, err = w.Write(bs)
+				if err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			})
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			client, err := intake.NewAPIClient(
+				sdkConfig.WithEndpoint(server.URL),
+				sdkConfig.WithoutAuthentication(),
+			)
+			if err != nil {
+				t.Fatalf("failed to create test client: %v", err)
+			}
+			var mods []func(m *inputModel)
+			if tt.limit > 0 {
+				mods = append(mods, func(m *inputModel) {
+					m.Limit = utils.Ptr(tt.limit)
+				})
+			}
+			model := fixtureInputModel(mods...)
+			got, err := fetchIntakes(testCtx, model, client)
+			if err != nil {
+				if !tt.fails {
+					t.Fatalf("fetchIntakes() unexpected error: %v", err)
+				}
+				return
+			}
+			if tt.fails {
+				t.Fatalf("fetchIntakes() expected an error, got none")
+			}
+			if callCount != len(tt.responses) {
+				t.Errorf("fetchIntakes() expected %d calls, got %d", len(tt.responses), callCount)
+			}
+			diff := cmp.Diff(got, tt.expected,
+				cmpopts.IgnoreFields(intake.IntakeResponse{}, "AdditionalProperties"),
+				cmpopts.IgnoreFields(intake.IntakeCatalog{}, "AdditionalProperties"),
+			)
+			if diff != "" {
+				t.Errorf("fetchIntakes() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

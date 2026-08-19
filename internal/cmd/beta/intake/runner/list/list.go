@@ -3,6 +3,7 @@ package list
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/stackitcloud/stackit-cli/internal/pkg/types"
 
@@ -22,6 +23,9 @@ import (
 
 const (
 	limitFlag = "limit"
+
+	// maxPageSize is the maximum number of items the API returns per page.
+	maxPageSize = int32(100)
 )
 
 // inputModel struct holds all the input parameters for the command
@@ -62,16 +66,9 @@ func NewCmd(p *types.CmdParams) *cobra.Command {
 			}
 
 			// Call API
-			req := buildRequest(ctx, model, apiClient)
-			resp, err := req.Execute()
+			runners, err := fetchIntakeRunners(ctx, model, apiClient)
 			if err != nil {
 				return fmt.Errorf("list Intake Runners: %w", err)
-			}
-			runners := resp.GetIntakeRunners()
-
-			// Truncate output
-			if model.Limit != nil && len(runners) > int(*model.Limit) {
-				runners = runners[:*model.Limit]
 			}
 
 			projectLabel := model.ProjectId
@@ -119,12 +116,40 @@ func parseInput(p *print.Printer, cmd *cobra.Command) (*inputModel, error) {
 }
 
 // buildRequest creates the API request to list Intake Runners
-func buildRequest(ctx context.Context, model *inputModel, apiClient *intake.APIClient) intake.ApiListIntakeRunnersRequest {
+func buildRequest(ctx context.Context, model *inputModel, apiClient *intake.APIClient, pageToken string, pageSize int32) intake.ApiListIntakeRunnersRequest {
 	req := apiClient.DefaultAPI.ListIntakeRunners(ctx, model.ProjectId, model.Region)
-	// Note: we do support API pagination, but for consistency with other services, we fetch all items and apply
-	// client-side limit.
-	// A more advanced implementation could use the --limit flag to set the API's PageSize.
+	req = req.PageSize(pageSize)
+	if pageToken != "" {
+		req = req.PageToken(pageToken)
+	}
 	return req
+}
+
+// fetchIntakeRunners retrieves Intake Runners from the API, following pagination until either the
+// requested limit is reached or no more pages remain.
+func fetchIntakeRunners(ctx context.Context, model *inputModel, apiClient *intake.APIClient) ([]intake.IntakeRunnerResponse, error) {
+	var pageToken string
+	runners := make([]intake.IntakeRunnerResponse, 0)
+	received := int64(0)
+	limit := int64(math.MaxInt64)
+	if model.Limit != nil {
+		limit = *model.Limit
+	}
+	for {
+		want := min(int64(maxPageSize), limit-received)
+		request := buildRequest(ctx, model, apiClient, pageToken, int32(want))
+		response, err := request.Execute()
+		if err != nil {
+			return nil, fmt.Errorf("list Intake Runners: %w", err)
+		}
+		runners = append(runners, response.GetIntakeRunners()...)
+		pageToken = response.GetNextPageToken()
+		received += want
+		if pageToken == "" || received >= limit {
+			break
+		}
+	}
+	return runners, nil
 }
 
 // outputResult formats the API response and prints it to the console

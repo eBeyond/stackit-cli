@@ -3,6 +3,7 @@ package list
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/spf13/cobra"
 	intake "github.com/stackitcloud/stackit-sdk-go/services/intake/v1betaapi"
@@ -22,6 +23,9 @@ import (
 const (
 	intakeIdFlag = "intake-id"
 	limitFlag    = "limit"
+
+	// maxPageSize is the maximum number of items the API returns per page.
+	maxPageSize = int32(100)
 )
 
 // inputModel struct holds all the input parameters for the command
@@ -63,16 +67,9 @@ func NewCmd(p *types.CmdParams) *cobra.Command {
 			}
 
 			// Call API
-			req := buildRequest(ctx, model, apiClient)
-			resp, err := req.Execute()
+			users, err := fetchIntakeUsers(ctx, model, apiClient)
 			if err != nil {
 				return fmt.Errorf("list Intake Users: %w", err)
-			}
-			users := resp.GetIntakeUsers()
-
-			// Truncate output
-			if model.Limit != nil && len(users) > int(*model.Limit) {
-				users = users[:*model.Limit]
 			}
 
 			projectLabel := model.ProjectId
@@ -125,9 +122,40 @@ func parseInput(p *print.Printer, cmd *cobra.Command) (*inputModel, error) {
 }
 
 // buildRequest creates the API request to list Intake Users
-func buildRequest(ctx context.Context, model *inputModel, apiClient *intake.APIClient) intake.ApiListIntakeUsersRequest {
+func buildRequest(ctx context.Context, model *inputModel, apiClient *intake.APIClient, pageToken string, pageSize int32) intake.ApiListIntakeUsersRequest {
 	req := apiClient.DefaultAPI.ListIntakeUsers(ctx, model.ProjectId, model.Region, *model.IntakeId)
+	req = req.PageSize(pageSize)
+	if pageToken != "" {
+		req = req.PageToken(pageToken)
+	}
 	return req
+}
+
+// fetchIntakeUsers retrieves Intake Users from the API, following pagination until either the
+// requested limit is reached or no more pages remain.
+func fetchIntakeUsers(ctx context.Context, model *inputModel, apiClient *intake.APIClient) ([]intake.IntakeUserResponse, error) {
+	var pageToken string
+	users := make([]intake.IntakeUserResponse, 0)
+	received := int64(0)
+	limit := int64(math.MaxInt64)
+	if model.Limit != nil {
+		limit = *model.Limit
+	}
+	for {
+		want := min(int64(maxPageSize), limit-received)
+		request := buildRequest(ctx, model, apiClient, pageToken, int32(want))
+		response, err := request.Execute()
+		if err != nil {
+			return nil, fmt.Errorf("list Intake Users: %w", err)
+		}
+		users = append(users, response.GetIntakeUsers()...)
+		pageToken = response.GetNextPageToken()
+		received += want
+		if pageToken == "" || received >= limit {
+			break
+		}
+	}
+	return users, nil
 }
 
 // outputResult formats the API response and prints it to the console

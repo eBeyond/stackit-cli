@@ -64,6 +64,7 @@ func fixtureInputModel(mods ...func(model *inputModel)) *inputModel {
 
 func fixtureRequest(mods ...func(request *intake.ApiListIntakeUsersRequest)) intake.ApiListIntakeUsersRequest {
 	request := testClient.DefaultAPI.ListIntakeUsers(testCtx, testProjectId, testRegion, testIntakeId)
+	request = request.PageSize(maxPageSize)
 	for _, mod := range mods {
 		mod(&request)
 	}
@@ -154,7 +155,7 @@ func TestBuildRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.description, func(t *testing.T) {
-			request := buildRequest(testCtx, tt.model, testClient)
+			request := buildRequest(testCtx, tt.model, testClient, "", maxPageSize)
 
 			diff := cmp.Diff(request, tt.expectedRequest,
 				cmp.AllowUnexported(tt.expectedRequest),
